@@ -1,540 +1,452 @@
-#!/usr/bin/env python3
+"""Select and publish one daily word for a KWGT lock-screen widget."""
+
 from __future__ import annotations
 
-import datetime as dt
-import html
+import argparse
+from dataclasses import dataclass
+from datetime import date, datetime
+import hashlib
 import json
 import os
-import random
-import re
-import sys
-import urllib.request
 from pathlib import Path
-from typing import Any
+import re
+import tempfile
+from typing import Any, Iterable
+import unicodedata
+from zoneinfo import ZoneInfo
 
-API_URL = "https://api.duocards.com/graphql"
-
-ROOT = Path(__file__).resolve().parents[1]
-HISTORY_FILE = ROOT / "data" / "history.json"
-WORD_JSON = ROOT / "word.json"
-WORD_TXT = ROOT / "word.txt"
-
-PAGE_SIZE = 100
-
-QUERY = r"""
-query cardsQuery(
-  $count: Int!
-  $cursor: String
-  $deckId: ID!
-  $search: String
-  $cardState: CardState
-) {
-  node(id: $deckId) {
-    __typename
-    ... on Deck {
-      cards(
-        first: $count
-        after: $cursor
-        search: $search
-        cardState: $cardState
-      ) {
-        edges {
-          node {
-            id
-            front
-            back
-            hint
-            knownCount
-            sCard {
-              theory {
-                theoryEn
-              }
-            }
-          }
-          cursor
-        }
-        pageInfo {
-          endCursor
-          hasNextPage
-        }
-      }
-      id
-    }
-    id
-  }
-}
-"""
+try:
+    from .duocards_client import DEFAULT_DECK_ID, FetchResult, fetch_all_cards
+    from .wiktionary_client import html_to_text, lookup_word
+except ImportError:  # Direct execution: python scripts/update_word.py
+    from duocards_client import DEFAULT_DECK_ID, FetchResult, fetch_all_cards
+    from wiktionary_client import html_to_text, lookup_word
 
 
-def clean_text(value: str | None) -> str:
-    """Turn DuoCards' light HTML/rich text into clean plain text."""
-    if not value:
+DEFAULT_TIMEZONE = "America/Sao_Paulo"
+DEFAULT_HISTORY_LIMIT = 120
+DEFAULT_NORMAL_MIN = 5
+DEFAULT_NORMAL_MAX = 6
+DEFAULT_HARD_MIN = 7
+
+
+class VocabularyBuilderError(RuntimeError):
+    """Raised when no valid daily output can be produced."""
+
+
+@dataclass(frozen=True)
+class Card:
+    id: str
+    key: str
+    word: str
+    translation: str
+    definition: str
+    example: str
+    known_count: int
+    source_id: str
+    s_card_id: str
+
+
+def normalize_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    return re.sub(r"\s+", " ", normalized).strip().casefold()
+
+
+def _string(value: Any) -> str:
+    return re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+
+
+def first_paragraph(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
         return ""
+    marked = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", value)
+    marked = re.sub(r"(?i)</\s*(?:p|div|li|h[1-6])\s*>", "\n\n", marked)
+    paragraphs = re.split(r"(?:\r?\n\s*){2,}", marked)
+    for paragraph in paragraphs:
+        text = html_to_text(paragraph)
+        if text:
+            return text
+    return ""
 
-    text = html.unescape(str(value))
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Keep paragraph breaks while removing HTML.
-    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
-    text = re.sub(r"(?i)<\s*/\s*p\s*>", "\n\n", text)
-    text = re.sub(r"(?i)<\s*p(?:\s[^>]*)?>", "", text)
-    text = re.sub(r"<[^>]+>", "", text)
+def normalize_card(raw: dict[str, Any]) -> Card | None:
+    word = _string(raw.get("front"))
+    known_count = raw.get("knownCount")
+    if not word or not isinstance(known_count, int) or isinstance(known_count, bool):
+        return None
 
-    text = "\n".join(
-        re.sub(r"[ \t]+", " ", line).strip()
-        for line in text.split("\n")
+    s_card = raw.get("sCard")
+    theory = s_card.get("theory") if isinstance(s_card, dict) else None
+    definition = first_paragraph(
+        theory.get("theoryEn") if isinstance(theory, dict) else None
     )
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
-
-
-def first_paragraph(value: str | None) -> str:
-    """Return only the first paragraph of DuoCards' English theory text."""
-    text = clean_text(value)
-    if not text:
-        return ""
-
-    paragraphs = [
-        p.strip()
-        for p in re.split(r"\n\s*\n", text)
-        if p.strip()
-    ]
-    first = paragraphs[0] if paragraphs else text
-
-    return re.sub(r"\s*\n\s*", " ", first).strip()
-
-
-def split_deck_ids(raw: str) -> list[str]:
-    """
-    Accept one Deck ID per line, or comma/semicolon-separated.
-    Duplicate IDs are removed automatically.
-    """
-    ids = [
-        item.strip()
-        for item in re.split(r"[\n,;]+", raw or "")
-        if item.strip()
-    ]
-    return list(dict.fromkeys(ids))
-
-
-def graphql_request(deck_id: str, cursor: str | None) -> dict[str, Any]:
-    payload = {
-        "query": QUERY,
-        "variables": {
-            "count": PAGE_SIZE,
-            "cursor": cursor,
-            "deckId": deck_id,
-            "search": "",
-            "cardState": None,
-        },
-    }
-
-    request = urllib.request.Request(
-        API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Vocabulary-builder/3.0",
-        },
-        method="POST",
+    return Card(
+        id=_string(raw.get("id")),
+        key=normalize_key(word),
+        word=word,
+        translation=_string(raw.get("back")),
+        definition=definition,
+        example=_string(raw.get("hint")),
+        known_count=known_count,
+        source_id=_string(raw.get("sourceId")),
+        s_card_id=_string(raw.get("sCardId")),
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        result = json.load(response)
 
-    if result.get("errors"):
-        raise RuntimeError(
-            "DuoCards GraphQL error: "
-            + json.dumps(result["errors"], ensure_ascii=False)
-        )
-
-    return result
+def _dedupe_sort_key(card: Card) -> tuple[Any, ...]:
+    complete = bool(card.definition and card.example)
+    populated = sum(bool(value) for value in (card.definition, card.example, card.translation))
+    content_length = len(card.definition) + len(card.example) + len(card.translation)
+    return (-int(complete), -card.known_count, -populated, -content_length, card.id)
 
 
-def fetch_deck(deck_id: str, deck_number: int) -> list[dict[str, Any]]:
-    cards: list[dict[str, Any]] = []
-    cursor: str | None = None
-
-    while True:
-        result = graphql_request(deck_id, cursor)
-        node = ((result.get("data") or {}).get("node"))
-
-        if not node:
-            raise RuntimeError("Deck not found for this Deck ID.")
-
-        connection = node.get("cards")
-        if not connection:
-            raise RuntimeError("DuoCards returned no cards connection.")
-
-        for edge in connection.get("edges", []):
-            card = edge.get("node") or {}
-
-            theory_en = (
-                (((card.get("sCard") or {}).get("theory") or {}).get("theoryEn"))
-            )
-
-            cards.append(
-                {
-                    "id": card.get("id"),
-                    "word": clean_text(card.get("front")),
-                    "translation": clean_text(card.get("back")),
-                    "definition": first_paragraph(theory_en),
-                    "example": clean_text(card.get("hint")),
-                    "known_count": int(card.get("knownCount") or 0),
-                    "deck_number": deck_number,
-                }
-            )
-
-        page_info = connection.get("pageInfo") or {}
-
-        if not page_info.get("hasNextPage"):
-            break
-
-        cursor = page_info.get("endCursor")
-        if not cursor:
-            raise RuntimeError(
-                "DuoCards says another page exists but returned no cursor."
-            )
-
-    return cards
-
-
-def fetch_all_decks(deck_ids: list[str]) -> list[dict[str, Any]]:
-    all_cards: list[dict[str, Any]] = []
-    errors: list[str] = []
-
-    for index, deck_id in enumerate(deck_ids, start=1):
-        try:
-            deck_cards = fetch_deck(deck_id, index)
-            all_cards.extend(deck_cards)
-            print(f"Deck {index}: {len(deck_cards)} cards.")
-        except Exception as exc:
-            errors.append(f"Deck {index}: {exc}")
-            print(f"WARNING: Deck {index} failed: {exc}", file=sys.stderr)
-
-    if not all_cards:
-        raise RuntimeError(
-            "No DuoCards deck could be read. " + " | ".join(errors)
-        )
-
-    # A word may exist in several old decks. Keep only one copy.
-    # Prefer: definition+example present -> higher knownCount -> richer text.
-    best_by_word: dict[str, dict[str, Any]] = {}
-
-    for card in all_cards:
-        key = card["word"].casefold().strip()
-        if not key:
+def deduplicate_cards(raw_cards: Iterable[dict[str, Any]]) -> list[Card]:
+    grouped: dict[str, list[Card]] = {}
+    for raw in raw_cards:
+        if not isinstance(raw, dict):
             continue
-
-        score = (
-            int(bool(card["definition"])) + int(bool(card["example"])),
-            card["known_count"],
-            len(card["definition"]) + len(card["example"]),
-        )
-
-        current = best_by_word.get(key)
-
-        if current is None:
-            best_by_word[key] = card
-            continue
-
-        current_score = (
-            int(bool(current["definition"])) + int(bool(current["example"])),
-            current["known_count"],
-            len(current["definition"]) + len(current["example"]),
-        )
-
-        if score > current_score:
-            best_by_word[key] = card
-
-    return list(best_by_word.values())
+        card = normalize_card(raw)
+        if card is not None:
+            grouped.setdefault(card.key, []).append(card)
+    return [min(group, key=_dedupe_sort_key) for _, group in sorted(grouped.items())]
 
 
-def load_history() -> list[dict[str, Any]]:
-    try:
-        value = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        return value if isinstance(value, list) else []
-    except Exception:
+def is_hard_day(day: date) -> bool:
+    return day.weekday() in {2, 6}  # Wednesday and Sunday
+
+
+def eligible_cards(
+    cards: Iterable[Card],
+    *,
+    hard_day: bool,
+    normal_min: int = DEFAULT_NORMAL_MIN,
+    normal_max: int = DEFAULT_NORMAL_MAX,
+    hard_min: int = DEFAULT_HARD_MIN,
+) -> list[Card]:
+    if hard_day:
+        return [card for card in cards if card.known_count >= hard_min]
+    return [card for card in cards if normal_min <= card.known_count <= normal_max]
+
+
+def load_history(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
         return []
-
-
-def env_int(name: str, default: int) -> int:
-    value = os.environ.get(name, "").strip()
-    return int(value) if value else default
-
-
-def parse_weekdays(raw: str) -> set[int]:
-    """
-    Python weekday numbers:
-    Monday=0, Tuesday=1, Wednesday=2, Thursday=3,
-    Friday=4, Saturday=5, Sunday=6.
-    """
-    result: set[int] = set()
-
-    for item in (raw or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-
-        day = int(item)
-        if day < 0 or day > 6:
-            raise ValueError("HARD_DAYS must contain only numbers from 0 to 6.")
-
-        result.add(day)
-
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VocabularyBuilderError(f"Invalid history file {path}: {error}") from error
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise VocabularyBuilderError(f"Invalid history schema in {path}")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise VocabularyBuilderError(f"Invalid history items in {path}")
+    result: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise VocabularyBuilderError(f"Invalid history entry in {path}")
+        required = ("date", "word", "key", "mode")
+        if any(not isinstance(item.get(field), str) for field in required):
+            raise VocabularyBuilderError(f"Invalid history entry fields in {path}")
+        result.append({field: item[field] for field in required})
     return result
 
 
-def eligible_content(card: dict[str, Any]) -> bool:
-    # The lock screen needs all three pieces.
-    return bool(
-        card["word"]
-        and card["definition"]
-        and card["example"]
+def _daily_order_key(card: Card, day: date, mode: str) -> str:
+    return hashlib.sha256(f"{day.isoformat()}|{mode}|{card.key}".encode()).hexdigest()
+
+
+def candidate_order(
+    cards: list[Card],
+    history: list[dict[str, str]],
+    *,
+    day: date,
+    hard_day: bool,
+    history_limit: int = DEFAULT_HISTORY_LIMIT,
+) -> list[Card]:
+    mode = "hard" if hard_day else "normal"
+    same_day_key = next(
+        (
+            item["key"]
+            for item in reversed(history)
+            if item["date"] == day.isoformat() and item["mode"] == mode
+        ),
+        None,
+    )
+    by_key = {card.key: card for card in cards}
+    ordered: list[Card] = []
+    if same_day_key in by_key:
+        ordered.append(by_key[same_day_key])
+
+    recent = history[-history_limit:] if history_limit else []
+    recent_keys = {item["key"] for item in recent}
+    unseen = [card for card in cards if card.key not in recent_keys]
+    unseen.sort(key=lambda card: _daily_order_key(card, day, mode))
+    ordered.extend(card for card in unseen if card.key != same_day_key)
+
+    last_seen: dict[str, int] = {}
+    for index, item in enumerate(history):
+        last_seen[item["key"]] = index
+    seen = [card for card in cards if card.key in recent_keys and card.key != same_day_key]
+    seen.sort(key=lambda card: (last_seen.get(card.key, -1), _daily_order_key(card, day, mode)))
+    ordered.extend(seen)
+    return ordered
+
+
+def enrich_card(card: Card) -> tuple[str, str, dict[str, str]] | None:
+    entry = lookup_word(card.word)
+    if entry is None or not entry.definition or not entry.example:
+        return None
+    return entry.definition, entry.example, entry.to_dict()
+
+
+def choose_enriched_card(
+    ordered_candidates: Iterable[Card], *, max_lookups: int
+) -> tuple[Card, str, str, dict[str, str]]:
+    if max_lookups < 1:
+        raise ValueError("max_lookups must be positive")
+    attempts = 0
+    for card in ordered_candidates:
+        attempts += 1
+        if attempts > max_lookups:
+            break
+        enriched = enrich_card(card)
+        if enriched is not None:
+            definition, example, provenance = enriched
+            return card, definition, example, provenance
+    raise VocabularyBuilderError(
+        f"No candidate produced both a definition and an example after {attempts if attempts <= max_lookups else max_lookups} lookups"
     )
 
 
-def select_word(
-    cards: list[dict[str, Any]],
-    history: list[dict[str, Any]],
-    date: dt.date,
-) -> tuple[dict[str, Any], str, bool]:
-    known_min = env_int("KNOWN_MIN", 5)
-    hard_min = env_int("HARD_MIN", 26)      # knownCount > 25
-    repeat_window = env_int("REPEAT_WINDOW", 120)
-    hard_days = parse_weekdays(
-        os.environ.get("HARD_DAYS", "2,6")  # Wednesday + Sunday
+def build_word_payload(
+    card: Card,
+    definition: str,
+    example: str,
+    provenance: dict[str, str],
+    *,
+    day: date,
+    hard_day: bool,
+) -> dict[str, Any]:
+    mode = "hard" if hard_day else "normal"
+    source_name = provenance.get("source") or provenance.get("definition_source") or ""
+    combined_source = (
+        "DuoCards"
+        if not source_name or source_name == "DuoCards"
+        else f"DuoCards + {source_name}"
     )
-
-    is_hard_day = date.weekday() in hard_days
-
-    if is_hard_day:
-        mode = "hard"
-        candidates = [
-            card
-            for card in cards
-            if eligible_content(card)
-            and card["known_count"] >= hard_min
-        ]
-
-        # Never break the feed if the hard pool is empty.
-        if not candidates:
-            mode = "hard-fallback"
-            candidates = [
-                card
-                for card in cards
-                if eligible_content(card)
-                and card["known_count"] >= known_min
-            ]
-
-    else:
-        mode = "regular"
-        candidates = [
-            card
-            for card in cards
-            if eligible_content(card)
-            and known_min <= card["known_count"] < hard_min
-        ]
-
-        # If no regular cards remain, use the broader known pool.
-        if not candidates:
-            mode = "regular-fallback"
-            candidates = [
-                card
-                for card in cards
-                if eligible_content(card)
-                and card["known_count"] >= known_min
-            ]
-
-    if not candidates:
-        raise RuntimeError(
-            "No eligible cards have word + English definition + example "
-            "under the configured knownCount thresholds."
-        )
-
-    recent_words = {
-        str(item.get("word", "")).casefold()
-        for item in history[-repeat_window:]
-        if item.get("word")
-    }
-
-    fresh = [
-        card
-        for card in candidates
-        if card["word"].casefold() not in recent_words
-    ]
-
-    # If the pool is smaller than the no-repeat window, restart gracefully.
-    pool = fresh or candidates
-
-    # Stable random choice for each calendar day.
-    seed = (
-        f"{date.isoformat()}|{mode}|{len(pool)}|"
-        + "|".join(
-            sorted((card["id"] or card["word"]) for card in pool)
-        )
-    )
-
-    randomizer = random.Random(seed)
-    chosen = randomizer.choice(pool)
-
-    return chosen, mode, is_hard_day
-
-
-def single_line(value: str) -> str:
-    """
-    TXT output is only a fallback. JSON is preferred in KWGT.
-    Avoid ~ because it is the TXT delimiter.
-    """
-    return re.sub(
-        r"\s+",
-        " ",
-        str(value).replace("~", "—"),
-    ).strip()
-
-
-def main() -> int:
-    deck_ids = split_deck_ids(
-        os.environ.get("DUOCARDS_DECK_IDS", "")
-    )
-
-    if not deck_ids:
-        print(
-            "Missing GitHub secret DUOCARDS_DECK_IDS.",
-            file=sys.stderr,
-        )
-        return 2
-
-    print(
-        f"Using {len(deck_ids)} unique Deck ID(s). "
-        "Duplicate IDs are ignored automatically."
-    )
-
-    # Workflow runs at 04:17 UTC, safely after midnight in São Paulo.
-    now_sao_paulo = (
-        dt.datetime.now(dt.timezone.utc)
-        - dt.timedelta(hours=3)
-    )
-    today = now_sao_paulo.date()
-
-    force_new = (
-        os.environ.get("FORCE_NEW", "").lower()
-        in {"1", "true", "yes"}
-    )
-
-    # Rerunning the workflow on the same day won't change the word.
-    if WORD_JSON.exists() and not force_new:
-        try:
-            current = json.loads(
-                WORD_JSON.read_text(encoding="utf-8")
-            )
-            if current.get("date") == today.isoformat():
-                print("Today's word already exists. Nothing to change.")
-                return 0
-        except Exception:
-            pass
-
-    cards = fetch_all_decks(deck_ids)
-    history = load_history()
-
-    chosen, mode, is_hard_day = select_word(
-        cards,
-        history,
-        today,
-    )
-
-    hard_day_label = "hard day" if is_hard_day else ""
-
-    output = {
-        "word": chosen["word"],
-        "definition": chosen["definition"],
-        "example": chosen["example"],
-        "translation": chosen["translation"],
-        "known_count": chosen["known_count"],
-        "hard_day": is_hard_day,
-        "hard_day_label": hard_day_label,
+    payload: dict[str, Any] = {
+        "word": card.word,
+        "definition": definition,
+        "example": example,
+        "translation": card.translation,
+        "known_count": card.known_count,
+        "hard_day": hard_day,
+        "hard_day_label": "hard day" if hard_day else "",
         "mode": mode,
-        "date": today.isoformat(),
-        "source": "DuoCards",
+        "date": day.isoformat(),
+        "source": combined_source,
+        "vocabulary_source": "DuoCards",
+        "definition_source": provenance.get("source")
+        or provenance.get("definition_source", ""),
+        "definition_source_url": provenance.get("source_url")
+        or provenance.get("definition_source_url", ""),
+        "attribution": provenance.get("attribution", ""),
+        "license_name": provenance.get("license_name", ""),
+        "license_url": provenance.get("license_url", ""),
     }
+    validate_word_payload(payload)
+    return payload
 
-    WORD_JSON.write_text(
-        json.dumps(
-            output,
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+
+def validate_word_payload(payload: dict[str, Any]) -> None:
+    for field in ("word", "definition", "example", "date", "mode"):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            raise VocabularyBuilderError(f"Output field {field!r} cannot be empty")
+    if payload["mode"] not in {"normal", "hard"}:
+        raise VocabularyBuilderError("Output mode must be normal or hard")
+    if not isinstance(payload.get("known_count"), int) or isinstance(
+        payload.get("known_count"), bool
+    ):
+        raise VocabularyBuilderError("Output known_count must be an integer")
+    if not isinstance(payload.get("hard_day"), bool):
+        raise VocabularyBuilderError("Output hard_day must be a boolean")
+
+
+def updated_history(
+    history: list[dict[str, str]],
+    card: Card,
+    *,
+    day: date,
+    hard_day: bool,
+    history_limit: int,
+) -> dict[str, Any]:
+    mode = "hard" if hard_day else "normal"
+    items = [item for item in history if item["date"] != day.isoformat()]
+    items.append(
+        {"date": day.isoformat(), "word": card.word, "key": card.key, "mode": mode}
+    )
+    if history_limit:
+        items = items[-history_limit:]
+    return {"version": 1, "items": items}
+
+
+def _txt_field(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("~", " ")).strip()
+
+
+def build_word_txt(payload: dict[str, Any]) -> str:
+    return "~".join(
+        _txt_field(str(payload[field]))
+        for field in ("word", "definition", "example", "hard_day_label")
+    ) + "\n"
+
+
+def _write_many_atomically(files: dict[Path, str]) -> None:
+    temporary: dict[Path, Path] = {}
+    try:
+        for destination, content in files.items():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                newline="\n",
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(content)
+                temporary[destination] = Path(handle.name)
+        for destination, temp_path in temporary.items():
+            os.replace(temp_path, destination)
+    finally:
+        for temp_path in temporary.values():
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _load_cards_input(path: Path) -> FetchResult:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VocabularyBuilderError(f"Invalid cards input {path}: {error}") from error
+    cards = payload.get("cards") if isinstance(payload, dict) else None
+    if not isinstance(cards, list):
+        raise VocabularyBuilderError(f"Cards input {path} has no cards list")
+    return FetchResult(
+        cards=cards,
+        release_id=payload.get("release_id"),
+        pages=int(payload.get("pages", 0)),
     )
 
-    # Fallback output:
-    # word~definition~example~hard day
-    WORD_TXT.write_text(
-        "~".join(
-            [
-                single_line(output["word"]),
-                single_line(output["definition"]),
-                single_line(output["example"]),
-                single_line(output["hard_day_label"]),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
+
+def resolve_day(value: str | None, timezone_name: str) -> date:
+    if value:
+        try:
+            return date.fromisoformat(value)
+        except ValueError as error:
+            raise VocabularyBuilderError(f"Invalid --date value {value!r}") from error
+    try:
+        return datetime.now(ZoneInfo(timezone_name)).date()
+    except Exception as error:
+        raise VocabularyBuilderError(f"Invalid timezone {timezone_name!r}") from error
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck-id", default=os.environ.get("DUOCARDS_DECK_ID", DEFAULT_DECK_ID))
+    parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
+    parser.add_argument("--date", help="Override local date (YYYY-MM-DD).")
+    parser.add_argument("--mode", choices=("auto", "normal", "hard"), default="auto")
+    parser.add_argument("--normal-min", type=int, default=DEFAULT_NORMAL_MIN)
+    parser.add_argument("--normal-max", type=int, default=DEFAULT_NORMAL_MAX)
+    parser.add_argument("--hard-min", type=int, default=DEFAULT_HARD_MIN)
+    parser.add_argument("--history-limit", type=int, default=DEFAULT_HISTORY_LIMIT)
+    parser.add_argument("--max-lookups", type=int, default=25)
+    parser.add_argument("--history", type=Path, default=Path("data/history.json"))
+    parser.add_argument("--word-json", type=Path, default=Path("word.json"))
+    parser.add_argument("--word-txt", type=Path, default=Path("word.txt"))
+    parser.add_argument("--cards-input", type=Path, help="Use a private snapshot instead of the API.")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.normal_min > args.normal_max:
+        raise VocabularyBuilderError("--normal-min cannot exceed --normal-max")
+    if args.history_limit < 1:
+        raise VocabularyBuilderError("--history-limit must be positive")
+
+    day = resolve_day(args.date, args.timezone)
+    hard = is_hard_day(day) if args.mode == "auto" else args.mode == "hard"
+    result = _load_cards_input(args.cards_input) if args.cards_input else fetch_all_cards(args.deck_id)
+    cards = deduplicate_cards(result.cards)
+    eligible = eligible_cards(
+        cards,
+        hard_day=hard,
+        normal_min=args.normal_min,
+        normal_max=args.normal_max,
+        hard_min=args.hard_min,
+    )
+    if not eligible:
+        raise VocabularyBuilderError("The selected knownCount bucket has no cards")
+
+    history = load_history(args.history)
+    ordered = candidate_order(
+        eligible,
+        history,
+        day=day,
+        hard_day=hard,
+        history_limit=args.history_limit,
+    )
+    card, definition, example, provenance = choose_enriched_card(
+        ordered, max_lookups=args.max_lookups
+    )
+    payload = build_word_payload(
+        card,
+        definition,
+        example,
+        provenance,
+        day=day,
+        hard_day=hard,
+    )
+    history_payload = updated_history(
+        history,
+        card,
+        day=day,
+        hard_day=hard,
+        history_limit=args.history_limit,
     )
 
-    history.append(
+    if args.dry_run:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    _write_many_atomically(
         {
-            "date": today.isoformat(),
-            "word": chosen["word"],
-            "known_count": chosen["known_count"],
-            "mode": mode,
-            "hard_day": is_hard_day,
+            args.word_json: json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            args.word_txt: build_word_txt(payload),
+            args.history: json.dumps(history_payload, ensure_ascii=False, indent=2) + "\n",
         }
     )
-
-    repeat_window = env_int("REPEAT_WINDOW", 120)
-    history_to_keep = max(repeat_window * 2, 300)
-
-    HISTORY_FILE.write_text(
-        json.dumps(
-            history[-history_to_keep:],
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    hard_min = env_int("HARD_MIN", 26)
-    known_min = env_int("KNOWN_MIN", 5)
-
-    regular_pool = sum(
-        1
-        for card in cards
-        if eligible_content(card)
-        and known_min <= card["known_count"] < hard_min
-    )
-
-    hard_pool = sum(
-        1
-        for card in cards
-        if eligible_content(card)
-        and card["known_count"] >= hard_min
-    )
-
     print(
-        f"Published {chosen['word']!r}. "
-        f"mode={mode}; "
-        f"knownCount={chosen['known_count']}; "
-        f"hard_day={is_hard_day}; "
-        f"unique_cards={len(cards)}; "
-        f"regular_pool={regular_pool}; "
-        f"hard_pool={hard_pool}."
+        json.dumps(
+            {
+                "date": payload["date"],
+                "mode": payload["mode"],
+                "word": payload["word"],
+                "known_count": payload["known_count"],
+                "eligible_cards": len(eligible),
+                "total_cards": len(cards),
+                "duocards_pages": result.pages,
+                "duocards_release_id": result.release_id,
+            },
+            ensure_ascii=False,
+        )
     )
-
     return 0
 
 

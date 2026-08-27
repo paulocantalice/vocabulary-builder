@@ -1,12 +1,18 @@
 {
-  "word": "Vocabulary builder",
-  "definition": "Run the GitHub Action once to load the first DuoCards word.",
-  "example": "Your DuoCards example will appear here.",
-  "translation": "",
-  "known_count": 0,
+  "word": "deadpan",
+  "definition": "Deliberately impassive or expressionless.",
+  "example": "a deadpan face or look",
+  "translation": "inexpressivo",
+  "known_count": 6,
   "hard_day": false,
   "hard_day_label": "",
-  "mode": "setup",
-  "date": "",
-  "source": "DuoCards"
+  "mode": "normal",
+  "date": "2026-08-27",
+  "source": "DuoCards + Wiktionary",
+  "vocabulary_source": "DuoCards",
+  "definition_source": "Wiktionary",
+  "definition_source_url": "https://en.wiktionary.org/wiki/deadpan",
+  "attribution": "English Wiktionary contributors",
+  "license_name": "CC BY-SA 4.0",
+  "license_url": "https://creativecommons.org/licenses/by-sa/4.0/"
 }

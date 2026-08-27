@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.publish/
+
+# Raw vocabulary snapshots are private diagnostics, not published artifacts.
+data/cards_snapshot.json
+data/sources_snapshot.json

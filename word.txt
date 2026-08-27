@@ -1,1 +1,1 @@
-Vocabulary builder~Run the GitHub Action once to load the first DuoCards word.~Your DuoCards example will appear here.~
+deadpan~Deliberately impassive or expressionless.~a deadpan face or look~

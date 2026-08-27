@@ -1,163 +1,214 @@
 # Vocabulary builder
 
-Daily English vocabulary for a KWGT lock-screen widget, sourced automatically from one or more DuoCards decks.
+Seleciona diariamente uma palavra do histórico pessoal do DuoCards e gera os
+arquivos consumidos pelo KWGT na tela bloqueada.
 
-## What appears on the lock screen
-
-Each day the project publishes:
-
-- **word**
-- **first English paragraph** from DuoCards `theoryEn`
-- **example sentence** from DuoCards `hint`
-- a subtle **hard day** label on Wednesdays and Sundays
-
-## Schedule
-
-### Regular days
-Monday, Tuesday, Thursday, Friday and Saturday:
-
-`knownCount 5–25`
-
-### Hard days
-Wednesday and Sunday:
-
-`knownCount >= 26`
-
-On hard days `word.json` contains:
-
-```json
-"hard_day": true,
-"hard_day_label": "hard day"
-```
-
-On regular days:
-
-```json
-"hard_day": false,
-"hard_day_label": ""
-```
-
-That means the KWGT text element can simply read `hard_day_label`: it will automatically be blank on regular days.
-
-## Multiple DuoCards decks
-
-Create one GitHub Actions repository secret named:
-
-`DUOCARDS_DECK_IDS`
-
-Put one Deck ID per line:
+O pipeline validado é:
 
 ```text
-DECK_ID_CURRENT
-DECK_ID_OLD_1
-DECK_ID_OLD_2
+DuoCards (palavra + progresso)
+        +
+Wiktionary (definição + exemplo)
+        ↓
+word.json / word.txt
+        ↓
+GitHub raw
+        ↓
+KWGT → LockStar
 ```
 
-Commas and semicolons also work.
+## O que causava o HTTP 403
 
-Duplicate Deck IDs are ignored automatically.
-
-If the same vocabulary word exists in several decks, the script keeps a single copy, preferring:
-
-1. a card with both definition and example;
-2. the larger `knownCount`;
-3. the richer definition/example text.
-
-## GitHub setup
-
-1. Create a public repository named `vocabulary-builder`.
-2. Upload all files from this project to the repository root.
-3. Go to:
-   `Settings → Secrets and variables → Actions`.
-4. Click `New repository secret`.
-5. Name it:
-   `DUOCARDS_DECK_IDS`.
-6. Put your DuoCards Deck IDs in the value, one per line.
-7. Go to:
-   `Actions → Daily DuoCards word`.
-8. Click:
-   `Run workflow`.
-
-After the first successful run, the workflow runs automatically every day at about 01:17 São Paulo time.
-
-## KWGT
-
-Replace `YOUR_GITHUB_USERNAME` in the formulas below.
-
-### Word
+O DuoCards mudou o formato de transporte esperado pela API. A consulta antiga
+do Duoload enviava o POST para:
 
 ```text
-$wg("https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/vocabulary-builder/main/word.json?d="+df(yyyyMMddHH), json, ".word")$
+https://api.duocards.com/graphql
 ```
 
-### Definition
+Em 27 de agosto de 2026, esse endereço retorna `403 Forbidden` para o payload
+de cards. A mesma consulta, sem token, cookie, `Origin`, `Referer` ou headers de
+versão, retorna HTTP 200 quando o nome da operação está na URL:
 
 ```text
-$wg("https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/vocabulary-builder/main/word.json?d="+df(yyyyMMddHH), json, ".definition")$
+https://api.duocards.com/graphql?cardsQuery
 ```
 
-### Example
+O corpo continua sendo `{ "query": ..., "variables": ... }`. Não é necessário
+copiar a sessão do Chrome nem guardar credenciais. O cliente mantém
+`?cardsQuery` literalmente e falha de forma explícita se a API mudar novamente.
+
+## Resultado observado na conta
+
+Snapshot de 2026-08-27:
+
+| Métrica | Valor |
+|---|---:|
+| Cards | 984 |
+| Palavras únicas | 984 |
+| Páginas GraphQL | 10 |
+| Cards com `hint` | 26 |
+| Cards com `theoryEn` | 0 |
+| Listas/fontes distintas | 9 |
+
+Distribuição de `knownCount`:
+
+| Valor | Cards |
+|---:|---:|
+| 0 | 1 |
+| 1 | 3 |
+| 2 | 9 |
+| 3 | 3 |
+| 4 | 31 |
+| 5 | 10 |
+| 6 | 41 |
+| 7 | 886 |
+
+O frontend atual só incrementa `knownCount` até 7 e considera `>= 7` como
+completamente aprendido. Portanto, as faixas antigas `> 25` nunca seriam
+selecionadas. Os defaults foram corrigidos para:
+
+- segunda, terça, quinta, sexta e sábado: `knownCount` 5–6;
+- quarta e domingo: `knownCount >= 7`, com `hard_day_label = "hard day"`.
+
+O deck reúne palavras oriundas de várias listas, inclusive `the-eaten-heart-boccaccio`.
+Isso confirma operacionalmente que o ID usado aqui é o vocabulário pessoal
+consolidado do par de idiomas, e não o ID de uma lista compartilhada.
+
+## Por que a definição vem do Wiktionary
+
+Nos 984 cards, `sCard.theory.theoryEn` é nulo. Consultar diretamente as nove
+listas-fonte também retornou zero `theoryEn`. Como apenas 26 cards têm `hint`, o
+DuoCards sozinho não consegue preencher diariamente definição e exemplo.
+
+O script consulta o endpoint oficial de definições do English Wiktionary apenas
+para candidatos elegíveis, até encontrar uma entrada com os dois campos. A
+atribuição, a página de origem e a licença CC BY-SA 4.0 ficam no `word.json`.
+
+## Arquivos
 
 ```text
-$wg("https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/vocabulary-builder/main/word.json?d="+df(yyyyMMddHH), json, ".example")$
+.github/workflows/update-word.yml  atualização diária às 04:17 UTC
+scripts/duocards_client.py         download paginado e defensivo
+scripts/wiktionary_client.py       definição, exemplo e atribuição
+scripts/update_word.py             seleção, histórico e escrita atômica
+scripts/analyze_cards.py            diagnóstico opcional
+data/history.json                  últimas 120 palavras
+word.json                          saída principal do KWGT
+word.txt                           fallback delimitado por ~
+tests/                             testes sem dependências externas
 ```
 
-### Hard-day label
+Os snapshots completos são privados e estão no `.gitignore`.
 
-```text
-$wg("https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/vocabulary-builder/main/word.json?d="+df(yyyyMMddHH), json, ".hard_day_label")$
+## Execução local
+
+Requer Python 3.11 ou superior e não possui dependências externas:
+
+```powershell
+python scripts/update_word.py
+python -m unittest discover -s tests -v
 ```
 
-Suggested styling for the hard-day label:
+Para analisar o deck e salvar snapshots privados:
 
-- small type
-- regular or medium weight
-- low opacity
-- place above the main word
-- do not add a background
+```powershell
+python scripts/analyze_cards.py `
+  --snapshot data/cards_snapshot.json `
+  --source-snapshot data/sources_snapshot.json `
+  --back-lang pt
+```
 
-Because the field is empty on normal days, the label disappears automatically.
+Uma simulação sem alterar arquivos:
 
-The hourly cache-buster (`yyyyMMddHH`) helps KWGT pick up the GitHub update after the scheduled 01:17 São Paulo run, even if it fetched the previous day's file shortly after midnight.
+```powershell
+python scripts/update_word.py --dry-run
+```
 
-## Example `word.json`
+As variáveis opcionais são:
+
+- `DUOCARDS_DECK_ID`: sobrescreve o ID padrão;
+- `WIKIMEDIA_USER_AGENT`: identificação recomendada pela Wikimedia, idealmente
+  com a URL do repositório ou um contato.
+
+## Regras de seleção
+
+1. Normaliza e deduplica a palavra com Unicode NFKC, espaços colapsados e
+   `casefold`.
+2. Em duplicatas, prioriza definição+exemplo, maior `knownCount`, maior
+   completude e ID estável.
+3. Exclui as últimas 120 palavras quando existem alternativas.
+4. Se o pool for menor, reutiliza primeiro a palavra exibida há mais tempo.
+5. A ordem diária é determinística por SHA-256; reexecutar na mesma data preserva
+   a palavra e não duplica o histórico.
+6. Só substitui os três arquivos depois de baixar, enriquecer e validar tudo. Se
+   a rede ou uma API falhar, a versão anterior permanece intacta.
+
+## Saída
+
+Exemplo abreviado:
 
 ```json
 {
-  "word": "perfunctory",
-  "definition": "done routinely and with little interest or care",
-  "example": "He gave the document only a perfunctory glance.",
-  "translation": "...",
-  "known_count": 31,
-  "hard_day": true,
-  "hard_day_label": "hard day",
-  "mode": "hard",
-  "date": "2026-08-30",
-  "source": "DuoCards"
+  "word": "deadpan",
+  "definition": "Deliberately impassive or expressionless.",
+  "example": "a deadpan face or look",
+  "translation": "inexpressivo",
+  "known_count": 6,
+  "hard_day": false,
+  "hard_day_label": "",
+  "mode": "normal",
+  "date": "2026-08-27",
+  "source": "DuoCards + Wiktionary"
 }
 ```
 
-## Changing the rules later
+`word.txt` contém quatro campos:
 
-Edit `.github/workflows/update-word.yml`.
+```text
+word~definition~example~hard day
+```
 
-Relevant settings:
+Quebras de linha e `~` internos são neutralizados antes da escrita.
 
-- `KNOWN_MIN: "5"` — lower bound for regular vocabulary.
-- `HARD_MIN: "26"` — hard words are `knownCount > 25`.
-- `HARD_DAYS: "2,6"` — Wednesday and Sunday.
-- `REPEAT_WINDOW: "120"` — tries not to repeat any of the last 120 words.
+## Fórmulas KWGT
 
-## Note about knownCount
+As fórmulas abaixo já usam o usuário GitHub conectado (`paulocantalice`).
 
-The open-source Duoload implementation treats:
+Palavra:
 
-- `0` as `new`
-- `1–4` as `learning`
-- `>=5` as `known`
+```text
+$wg("https://raw.githubusercontent.com/paulocantalice/vocabulary-builder/main/word.json?t="+df(yyyyMMddHH), json, ".word")$
+```
 
-DuoCards does not publicly document that `knownCount` is literally the number of right-swipes, so Vocabulary builder treats it as a progress/review counter rather than assuming its exact semantics.
+Definição:
 
-## Technical note
+```text
+$wg("https://raw.githubusercontent.com/paulocantalice/vocabulary-builder/main/word.json?t="+df(yyyyMMddHH), json, ".definition")$
+```
 
-This is an unofficial integration using DuoCards' current GraphQL structure. DuoCards can change its API/schema in the future, in which case the script may need a small update.
+Exemplo:
+
+```text
+$wg("https://raw.githubusercontent.com/paulocantalice/vocabulary-builder/main/word.json?t="+df(yyyyMMddHH), json, ".example")$
+```
+
+Hard day:
+
+```text
+$wg("https://raw.githubusercontent.com/paulocantalice/vocabulary-builder/main/word.json?t="+df(yyyyMMddHH), json, ".hard_day_label")$
+```
+
+## Automação e publicação
+
+O workflow roda às `04:17 UTC` (`01:17 America/Sao_Paulo`) e também aceita
+execução manual. Só cria commit quando a saída muda.
+
+Há duas ressalvas antes de tornar o repositório público:
+
+1. A GraphQL do DuoCards não é uma API pública documentada. Os Termos atuais não
+   autorizam expressamente automação, embora esta implementação não use token nem
+   contorne autenticação. Confirme esse uso com o DuoCards antes de operar o cron
+   permanentemente.
+2. Definição e exemplo são texto do Wiktionary sob CC BY-SA 4.0. Preserve
+   `NOTICE.md`, os campos de atribuição do JSON e a licença ao redistribuir.
