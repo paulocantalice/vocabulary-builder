@@ -1,0 +1,12 @@
+{
+  "word": "Vocabulary builder",
+  "definition": "Run the GitHub Action once to load the first DuoCards word.",
+  "example": "Your DuoCards example will appear here.",
+  "translation": "",
+  "known_count": 0,
+  "hard_day": false,
+  "hard_day_label": "",
+  "mode": "setup",
+  "date": "",
+  "source": "DuoCards"
+}
